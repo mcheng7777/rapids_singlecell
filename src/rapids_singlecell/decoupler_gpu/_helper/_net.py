@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from numba import cuda
+import cupy as cp
 import numpy as np
 import pandas as pd
 
@@ -168,3 +170,10 @@ def idxmat(
     m = f"Network has {targets.size} unique features and {sources.size} unique sources"
     _log(m, level="info", verbose=verbose)
     return sources, cnct, starts, offsets
+
+# @cuda.jit(cache=True)
+def _getset(cnct: cp.ndarray, starts: cp.ndarray, offsets: cp.ndarray, j: int) -> cp.ndarray:
+    srt = starts[j]
+    off = srt + offsets[j]
+    fset = cnct[srt:off]
+    return fset
