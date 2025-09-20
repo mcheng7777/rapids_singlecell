@@ -45,21 +45,34 @@ void gsea_kernel(
     const int set_idx = blockIdx.x;
     const int obs_idx = blockIdx.y * blockDim.x + threadIdx.x;
     if (obs_idx >= n_obs || set_idx >= n_sets) return;
+    const int MAX_FEATURES = 1000;
+    if (n_features > MAX_FEATURES) return;  // Bounds check for fixed array
+    printf("=== DEBUG: set_idx=%d, obs_idx=%d ===\n", set_idx, obs_idx);
     
     const bool* set_msk = set_msks + set_idx * n_features;
     
+    // Create sorted set_msk for this observation
+    bool sorted_set_msk[MAX_FEATURES];
+    for (int k = 0; k < n_features && k < MAX_FEATURES; k++) {
+        int rank_idx = rnks[obs_idx * n_features + k];
+        sorted_set_msk[k] = set_msk[rank_idx];
+    }
+    
     const float dec = decs[set_idx];
+    printf("dec = %f\n", dec);
 
     // ES section
     // compute norm
     float sum_set = 0.0f;
-    for (int k = 0; k < n_features; k++) {
-        if (set_msk[k]) {
+    for (int k = 0; k < n_features && k < MAX_FEATURES; k++) {
+        if (sorted_set_msk[k]) {
             float val = mat[obs_idx * n_features + k];
             sum_set += (val >= 0.0f) ? val : -val;
+            printf("Feature %d in set: val=%f, abs_val=%f, sum_set=%f\n", 
+                   k, val, (val >= 0.0f) ? val : -val, sum_set);
         }
     }
-
+    printf("Final sum_set = %f\n", sum_set);
     
     // compute ES
     float true_es = 0.0f;
@@ -71,39 +84,50 @@ void gsea_kernel(
 
     if (sum_set == 0.0f) {
         true_es = 0.0f;
+        printf("sum_set is 0, setting true_es = 0\n");
     } else {
-        for (int i = 0; i < n_features; i++) {
-            int rank_idx = rnks[obs_idx * n_features + i];
-            if (set_msk[rank_idx]) {
+        printf("\n--- ES Calculation ---\n");
+        for (int rank_idx = 0; rank_idx < n_features && rank_idx < MAX_FEATURES; rank_idx++) {
+            if (sorted_set_msk[rank_idx]) {
                 float val = mat[obs_idx * n_features + rank_idx];
                 cum_sum += ((val >= 0.0f) ? val : -val) / sum_set;   
+                printf("rank_idx=%d, val=%f, abs_val=%f, cum_sum=%f (in set)\n", 
+                       rank_idx, val, (val >= 0.0f) ? val : -val, cum_sum);
             } else {
                 cum_sum -= dec;
+                printf("rank_idx=%d, cum_sum=%f (not in set, dec=%f)\n", 
+                       rank_idx, cum_sum, dec);
             }
             // update max positive and negative deviations
             if (cum_sum > mx_pos) {
                 mx_pos = cum_sum;
                 j_pos = rank_idx;
+                printf("  -> New max_pos: %f at rank_idx=%d\n", mx_pos, j_pos);
             }
             if (cum_sum < mx_neg) {
                 mx_neg = cum_sum;
                 j_neg = rank_idx;
+                printf("  -> New max_neg: %f at rank_idx=%d\n", mx_neg, j_neg);
             }
         }
         // determine if pos or neg are more enriched
         if (mx_pos > -mx_neg) {
             true_es = mx_pos;
+            printf("\nFinal ES: %f (positive, from rank_idx=%d)\n", true_es, j_pos);
         } else {
             true_es = mx_neg;
+            printf("\nFinal ES: %f (negative, from rank_idx=%d)\n", true_es, j_neg);
         }
     }
 
 
     // NES section
     if (n_permutations <= 1){
+        printf("\n--- No Permutations (n_permutations=%d) ---\n", n_permutations);
         es[obs_idx * n_sets + set_idx] = true_es;
         nes[obs_idx * n_sets + set_idx] = 0.0f;
         pv[obs_idx * n_sets + set_idx] = 1.0f;
+        printf("Final results: ES=%f, NES=0.0, PV=1.0\n", true_es);
     } else {
         // compute null distribution
         float null_sum_pos = 0.0f;
@@ -113,27 +137,42 @@ void gsea_kernel(
         int pos_ge_es_count = 0;
         int neg_le_es_count = 0;
         for (int perm = 0; perm < n_permutations; perm++) {
-            // compute null sum
+            printf("\nPermutation %d:\n", perm);
+            // compute null sum - use permuted set mask
             float perm_sum_set = 0.0f;
             float perm_cum_sum = 0.0f;
             float perm_mx_pos = 0.0f;
             float perm_mx_neg = 0.0f;
             float perm_mx_value = 0.0f;
-            for (int k = 0; k < n_features; k++) {
-                if (set_msk[ridx[perm * n_features + k]]) {
+            
+            // Create sorted permuted set_msk for this observation and permutation
+            bool sorted_perm_set_msk[MAX_FEATURES];
+            for (int k = 0; k < n_features && k < MAX_FEATURES; k++) {
+                int rank_idx = rnks[obs_idx * n_features + k];
+                sorted_perm_set_msk[k] = set_msk[ridx[perm * n_features + rank_idx]];
+            }
+            
+            // First compute sum for permuted set
+            for (int k = 0; k < n_features && k < MAX_FEATURES; k++) {
+                if (sorted_perm_set_msk[k]) {
                     float val = mat[obs_idx * n_features + k];
                     perm_sum_set += (val >= 0.0f) ? val : -val;
+                    printf("  k=%d, val=%f, perm_sum_set=%f\n", 
+                           k, val, perm_sum_set);
                 }
             }
+            
             if (perm_sum_set == 0.0f){
                 perm_mx_value = 0.0f;
+                printf("  perm_sum_set is 0, setting perm_mx_value = 0\n");
             } else {
-                // compute null ES
-                for (int i = 0; i < n_features; i++) {
-                    int rank_idx = rnks[obs_idx * n_features + i];
-                    if (set_msk[ridx[perm * n_features + rank_idx]]) {
+                // compute null ES using permuted set mask
+                for (int rank_idx = 0; rank_idx < n_features && rank_idx < MAX_FEATURES; rank_idx++) {
+                    if (sorted_perm_set_msk[rank_idx]) {
                         float val = mat[obs_idx * n_features + rank_idx];
                         perm_cum_sum += ((val >= 0.0f) ? val : -val) / perm_sum_set;
+                        printf("  rank_idx=%d, val=%f, abs_val=%f, perm_cum_sum=%f (in set)\n", 
+                               rank_idx, val, (val >= 0.0f) ? val : -val, perm_cum_sum);
                     } else {
                         perm_cum_sum -= dec;
                     }
@@ -147,37 +186,54 @@ void gsea_kernel(
             }
             // update null sum and counts
             perm_mx_value = (perm_mx_pos > -perm_mx_neg) ? perm_mx_pos : perm_mx_neg;
+            printf("  perm_mx_value = %f (mx_pos=%f, mx_neg=%f)\n", 
+                   perm_mx_value, perm_mx_pos, perm_mx_neg);
             if (perm_mx_value >= 0.0f){
                 null_sum_pos += perm_mx_value;
                 null_count_pos++;
                 if (perm_mx_value >= true_es) pos_ge_es_count++;
+                printf("  -> Positive null: %f, count=%d, ge_es_count=%d\n", 
+                       perm_mx_value, null_count_pos, pos_ge_es_count);
             } else {
                 null_sum_neg += perm_mx_value;
                 null_count_neg++;
                 if (perm_mx_value <= true_es) neg_le_es_count++;
+                printf("  -> Negative null: %f, count=%d, le_es_count=%d\n", 
+                       perm_mx_value, null_count_neg, neg_le_es_count);
             }
         }
         // compute NES and p-value
         float pval = 1.0f;
         float nes_val = 0.0f;
+        printf("\n--- NES and P-value Calculation ---\n");
+        printf("true_es = %f\n", true_es);
+        printf("null_count_pos = %d, null_count_neg = %d\n", null_count_pos, null_count_neg);
+        printf("pos_ge_es_count = %d, neg_le_es_count = %d\n", pos_ge_es_count, neg_le_es_count);
+        printf("\n");
 
         if (true_es >= 0.0f && null_count_pos > 0){
             pval = (float)pos_ge_es_count / null_count_pos;
             float pos_null_mean = null_sum_pos / null_count_pos;
             nes_val = true_es / pos_null_mean;
+            printf("Positive case: pval=%f, pos_null_mean=%f, nes_val=%f\n", 
+                   pval, pos_null_mean, nes_val);
         } else if (true_es < 0.0f && null_count_neg > 0){
             pval = (float)neg_le_es_count / null_count_neg;
             float neg_null_mean = null_sum_neg / null_count_neg;
             nes_val = -true_es / neg_null_mean;
+            printf("Negative case: pval=%f, neg_null_mean=%f, nes_val=%f\n", 
+                   pval, neg_null_mean, nes_val);
         } else {
             nes_val = 0.0f;
             pval = 1.0f;
+            printf("Edge case: nes_val=0.0, pval=1.0\n");
         }
 
         // write to output
         es[obs_idx * n_sets + set_idx] = true_es;
         nes[obs_idx * n_sets + set_idx] = nes_val;
         pv[obs_idx * n_sets + set_idx] = pval;
+        printf("\nFinal results: ES=%f, NES=%f, PV=%f\n", true_es, nes_val, pval);
     }
 }
 """,
@@ -195,16 +251,22 @@ def _ridx(
 ):
     idx = cp.tile(cp.arange(nvar), (times, 1))
     if seed:
-        rng = cp.random.RandomState(seed=seed)
-        for i in idx:
+        # Use numpy random generator to match CPU implementation
+        rng = np.random.default_rng(seed=seed)
+        idx_np = idx.get()  # Convert to numpy
+        for i in idx_np:
             rng.shuffle(i)
+        idx = cp.array(idx_np)  # Convert back to cupy
     return idx
 
-def _stgsea(mat, cnct, starts, offsets, ridx, times, seed, verbose) -> tuple[cp.ndarray, cp.ndarray]:
+def _stsgsea(mat, cnct, starts, offsets, ridx, times, seed, verbose) -> tuple[cp.ndarray, cp.ndarray]:
     """Use the full batch kernel for maximum parallelism."""
-    # Compute per-observation ranks (descending by value)
-    # rnks[i, :] gives feature indices sorted for observation i
-    rnks = rank_rows_desc(mat)
+    # Sort data per observation (descending by value) to match CPU implementation
+    idx = rank_rows_desc(mat)
+    
+    # Create sorted data array using ranking indices
+    mat = cp.take_along_axis(mat, idx, axis=1).astype(cp.float32)
+    
     
     nobs, nvar = mat.shape
     nsrc = starts.size
@@ -218,19 +280,20 @@ def _stgsea(mat, cnct, starts, offsets, ridx, times, seed, verbose) -> tuple[cp.
         set_msk_batch[j, fset] = True
         dec_batch[j] = 1.0 / (nvar - fset.size)
     
-    es = cp.zeros((n_obs, n_sources), dtype=cp.float32)
-    nes = cp.zeros((n_obs, n_sources), dtype=cp.float32)
-    pv = cp.zeros((n_obs, n_sources), dtype=cp.float32)
+    rnks = idx.astype(cp.int32)
+    es = cp.zeros((nobs, nsrc), dtype=cp.float32)
+    nes = cp.zeros((nobs, nsrc), dtype=cp.float32)
+    pv = cp.zeros((nobs, nsrc), dtype=cp.float32)
 
     threads_per_block = 32
-    blocks_x = n_sources
-    blocks_y = (n_obs + threads_per_block - 1) // threads_per_block
+    blocks_x = nsrc
+    blocks_y = (nobs + threads_per_block - 1) // threads_per_block
 
 
     _gsea_kernel(
         (blocks_x, blocks_y), 
         (threads_per_block, 1),
-        (mat, set_msk_batch, dec_batch, ridx, rnks, es, nes, pv, n_obs, n_sources, n_features, times)
+        (mat, set_msk_batch, dec_batch, ridx, rnks, es, nes, pv, nobs, nsrc, nvar, times)
     )
     
     return es, nes, pv
@@ -354,9 +417,9 @@ def _func_gsea(
     if times > 1:
         m = f"gsea - comparing estimates against {times} random permutations"
         _log(m, level="info", verbose=verbose)
-        ridx = _ridx(times=times, nvar=nvar, seed=0)
+        ridx = _ridx(times=times, nvar=nvar, seed=0).astype(cp.int32)
     else:
-        ridx = _ridx(times=times, nvar=nvar, seed=None)
+        ridx = _ridx(times=times, nvar=nvar, seed=None).astype(cp.int32)
     
     es, nes, pv = _stsgsea(mat, cnct, starts, offsets, ridx, times, seed, verbose)
     if times > 1:
